@@ -7,8 +7,24 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
+<script>
+/* Compatibilité : pdf.js récent utilise des fonctions JS très neuves, absentes de certains navigateurs */
+for(const C of [Map,WeakMap]){
+  if(!C.prototype.getOrInsertComputed)C.prototype.getOrInsertComputed=function(k,f){if(!this.has(k))this.set(k,f(k));return this.get(k)};
+  if(!C.prototype.getOrInsert)C.prototype.getOrInsert=function(k,v){if(!this.has(k))this.set(k,v);return this.get(k)};
+}
+if(!Math.sumPrecise)Math.sumPrecise=function(it){let s=0;for(const v of it)s+=v;return s};
+if(!Promise.withResolvers)Promise.withResolvers=function(){let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject}};
+if(!Promise.try)Promise.try=function(f,...a){return new Promise(r=>r(f(...a)))};
+if(!Uint8Array.fromBase64)Uint8Array.fromBase64=function(s){const b=atob(s);const u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u};
+if(!Uint8Array.prototype.toBase64)Uint8Array.prototype.toBase64=function(){let s="";for(let i=0;i<this.length;i+=32768)s+=String.fromCharCode.apply(null,this.subarray(i,i+32768));return btoa(s)};
+</script>
+<script type="module">
+import * as pdfjsLib from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/6.3.289/pdf.min.mjs";
+try{globalThis.pdfjsWorker=await import("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/6.3.289/pdf.worker.min.mjs")}catch(e){}
+pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/6.3.289/pdf.worker.min.mjs";
+window.pdfjsLib=pdfjsLib;window.dispatchEvent(new Event("pdfready"));
+</script>
 <style>
 /* Layout: colonne réglages (gauche) + file d'images (droite), empilées sur mobile */
 :root{
@@ -254,7 +270,10 @@ fileIn.addEventListener("change",()=>{addFiles(fileIn.files);fileIn.value=""});
 drop.addEventListener("drop",e=>addFiles(e.dataTransfer.files));
 document.addEventListener("paste",e=>{const f=[...(e.clipboardData?.files||[])];if(f.length)addFiles(f)});
 
-if(window.pdfjsLib)pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+function getPdf(){
+  if(window.pdfjsLib)return Promise.resolve(window.pdfjsLib);
+  return new Promise(res=>{addEventListener("pdfready",()=>res(window.pdfjsLib),{once:true});setTimeout(()=>res(window.pdfjsLib||null),20000)});
+}
 const isPdf=f=>f.type==="application/pdf"||/\.pdf$/i.test(f.name);
 async function addFiles(list){
   const files=[...list].filter(f=>f.type.startsWith("image/")||/\.(heic|heif)$/i.test(f.name)||isPdf(f));
@@ -262,9 +281,10 @@ async function addFiles(list){
   items=items.filter(i=>!i.sample);
   for(const f of files){
     if(!isPdf(f)){items.push({id:++uid,file:f,name:f.name,size:f.size,srcSize:f.size,thumb:URL.createObjectURL(f),out:null,status:"wait"});continue}
-    if(typeof pdfjsLib==="undefined"){toast("Le lecteur PDF n'a pas chargé. Recharge la page.");continue}
+    const pdfjs=await getPdf();
+    if(!pdfjs){toast("Le lecteur PDF n'a pas chargé. Recharge la page.");continue}
     try{
-      const doc=await pdfjsLib.getDocument({data:new Uint8Array(await f.arrayBuffer())}).promise;
+      const doc=await pdfjs.getDocument({data:new Uint8Array(await f.arrayBuffer())}).promise;
       const base=f.name.replace(/\.pdf$/i,"");
       for(let n=1;n<=doc.numPages;n++)
         items.push({id:++uid,pdf:{doc,page:n,pages:doc.numPages,dpi:0},file:null,name:doc.numPages>1?`${base}-p${n}`:base,size:0,srcSize:n===1?f.size:0,thumb:"",out:null,status:"wait"});
@@ -284,7 +304,7 @@ async function renderPdfPage(it,dpi){
   const vp=page.getViewport({scale:sc});
   const c=document.createElement("canvas");c.width=Math.round(vp.width);c.height=Math.round(vp.height);
   const ctx=c.getContext("2d");ctx.fillStyle="#fff";ctx.fillRect(0,0,c.width,c.height);
-  await page.render({canvasContext:ctx,viewport:vp}).promise;
+  await page.render({canvasContext:ctx,canvas:c,viewport:vp}).promise;
   const blob=await new Promise(r=>c.toBlob(r,"image/png"));
   it.file=new File([blob],it.name+".png",{type:"image/png"});it.size=blob.size;it.pdf.dpi=dpi;
   if(it.thumb)URL.revokeObjectURL(it.thumb);
