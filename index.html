@@ -87,7 +87,8 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 .bar i{display:block;height:100%;background:var(--good);width:0;transition:width .3s}
 .gain{font:500 14px var(--f-mono);color:var(--good);text-align:right;min-width:52px}
 .gain.warn{color:var(--warn)}
-.note{font-size:12px;color:var(--warn)}
+.note{font-size:12px;color:var(--muted)}
+.note.warn{color:var(--warn)}
 .side{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
 .rm{all:unset;cursor:pointer;color:var(--muted);font-size:12px}
 .rm:hover{color:var(--ink)}
@@ -145,7 +146,8 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       <div>
         <p class="label">Poids cible (optionnel)</p>
         <div class="num"><input type="text" inputmode="decimal" id="target" placeholder="ex. 1,5" aria-label="Poids cible maximum"><select id="targetUnit" aria-label="Unité du poids cible" style="flex:0 0 auto"><option value="1048576" selected>Mo</option><option value="1024">Ko</option></select></div>
-        <p class="hint">Baisse la qualité automatiquement jusqu'à passer sous ce poids. Pratique pour les mails.</p>
+        <p class="hint">Vise le plus près possible sous ce poids, en gardant la taille d'origine tant que c'est possible.</p>
+        <p class="hint" id="autoHint" hidden style="color:var(--accent)">Poids cible actif : qualité et dimensions sont réglées automatiquement.</p>
       </div>
 
       <label class="check"><input type="checkbox" id="keepOrig" checked> Garder l'original s'il est déjà plus léger que le résultat</label>
@@ -203,8 +205,11 @@ function syncUI(){
   document.querySelectorAll("#fmt button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.f===state.fmt));
   $("fmtHint").textContent=HINTS[state.fmt];
   $("quality").value=state.q;$("qOut").textContent=state.q;
-  $("quality").disabled=state.fmt==="image/png";
+  const auto=state.target>0;
+  $("quality").disabled=state.fmt==="image/png"||auto;
+  $("maxSide").disabled=auto;
   $("maxSide").value=state.max;
+  $("autoHint").hidden=!auto;
 }
 function setPreset(p){
   document.querySelectorAll(".preset").forEach(b=>b.setAttribute("aria-pressed",b.dataset.p===p));
@@ -219,7 +224,7 @@ $("maxSide").addEventListener("input",e=>{const v=+e.target.value;if(v>=100){sta
 function readTarget(){
   const v=parseFloat(String($("target").value).replace(",",".").replace(/[^\d.]/g,""));
   state.target=v>0?Math.round(v*+$("targetUnit").value):0;
-  scheduleAll();
+  syncUI();scheduleAll();
 }
 $("target").addEventListener("input",readTarget);
 $("targetUnit").addEventListener("change",readTarget);
@@ -251,31 +256,88 @@ async function decode(file){
   }
 }
 function encode(canvas,type,q){return new Promise(r=>canvas.toBlob(b=>r(b),type,q/100))}
+const IOS=/iP(hone|ad|od)/.test(navigator.userAgent)||(navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1);
+const MAXPX=IOS?16e6:120e6; // limite de taille du canvas (Safari iPhone : ~16 Mpx)
+
+function draw(src,w,h,fmt){
+  const c=document.createElement("canvas");c.width=w;c.height=h;
+  const ctx=c.getContext("2d");
+  if(fmt==="image/jpeg"){ctx.fillStyle="#fff";ctx.fillRect(0,0,w,h)} // fond blanc pour la transparence
+  ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality="high";
+  ctx.drawImage(src,0,0,w,h);
+  return c;
+}
+function dims(w0,h0,scale){
+  let sc=Math.min(1,scale);
+  if(w0*h0*sc*sc>MAXPX)sc=Math.sqrt(MAXPX/(w0*h0));
+  return {sc,w:Math.max(1,Math.round(w0*sc)),h:Math.max(1,Math.round(h0*sc))};
+}
 
 async function compress(it,s){
   const src=await decode(it.file);
   const w0=src.width,h0=src.height;
-  const scale=Math.min(1,s.max/Math.max(w0,h0));
-  const w=Math.round(w0*scale),h=Math.round(h0*scale);
-  const c=document.createElement("canvas");c.width=w;c.height=h;
-  const ctx=c.getContext("2d");
-  if(s.fmt==="image/jpeg"){ctx.fillStyle="#fff";ctx.fillRect(0,0,w,h)} // fond blanc pour la transparence
-  ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality="high";
-  ctx.drawImage(src,0,0,w,h);
-  if(src.close)src.close();
-  let q=s.q,blob=await encode(c,s.fmt,q),hitTarget=true;
-  if(s.target>0&&s.fmt!=="image/png"){
-    const lim=s.target;
-    if(blob.size>lim){
-      let lo=20,hi=q,best=null;
-      for(let k=0;k<7;k++){const mid=Math.round((lo+hi)/2);const b=await encode(c,s.fmt,mid);if(b.size<=lim){best={b,q:mid};lo=mid+1}else hi=mid-1;if(lo>hi)break}
-      if(best){blob=best.b;q=best.q}else{blob=await encode(c,s.fmt,20);q=20;hitTarget=blob.size<=lim}
+  try{
+    return s.target>0?await toTarget(it,s,src,w0,h0):await simple(it,s,src,w0,h0);
+  }finally{if(src.close)src.close()}
+}
+
+/* Mode classique : taille max + qualité choisies */
+async function simple(it,s,src,w0,h0){
+  const {sc,w,h}=dims(w0,h0,s.max/Math.max(w0,h0));
+  const c=draw(src,w,h,s.fmt);
+  let blob=await encode(c,s.fmt,s.q);
+  if(!blob)throw new Error("encode");
+  let note=null;
+  if(s.keepOrig&&blob.size>=it.size&&sc===1&&it.file.type===s.fmt){blob=it.file;note={t:"Déjà optimisée : l'original est conservé."}}
+  return finish(it,s,blob,w,h,w0,h0,s.q,note);
+}
+
+/* Mode poids cible : on vise le plus près possible SOUS la cible.
+   1) taille d'origine, meilleure qualité qui passe sous la cible
+   2) si même à qualité 60 c'est trop lourd, on réduit les dimensions et on recommence */
+async function toTarget(it,s,src,w0,h0){
+  const lim=s.target;
+  if(s.keepOrig&&it.size<=lim&&it.file.type===s.fmt)
+    return finish(it,s,it.file,w0,h0,w0,h0,100,{t:`Déjà sous ${fmtSize(lim)} : l'original est conservé (le regonfler ne ferait que perdre en qualité).`});
+  let scale=1,last=null;
+  for(let pass=0;pass<5;pass++){
+    const {sc,w,h}=dims(w0,h0,scale);
+    const c=draw(src,w,h,s.fmt);
+    const capped=sc<scale-1e-6;
+    if(s.fmt==="image/png"){
+      const b=await encode(c,s.fmt,100);if(!b)throw new Error("encode");
+      last={b,w,h,q:100};
+      if(b.size<=lim)return finish(it,s,b,w,h,w0,h0,100,sizeNote(b.size,lim,w,h,w0,h0,100,capped));
+      scale=sc*Math.sqrt(lim/b.size)*0.97;continue;
     }
+    const top=await encode(c,s.fmt,100);if(!top)throw new Error("encode");
+    if(top.size<=lim)return finish(it,s,top,w,h,w0,h0,100,sizeNote(top.size,lim,w,h,w0,h0,100,capped));
+    const floor=await encode(c,s.fmt,60);
+    last={b:floor,w,h,q:60};
+    if(floor.size>lim){scale=sc*Math.sqrt(lim/floor.size)*0.97;continue}
+    // recherche dichotomique de la qualité (décimale) la plus haute qui tient sous la cible
+    let lo=60,hi=100,best={b:floor,q:60};
+    for(let k=0;k<9;k++){
+      const mid=(lo+hi)/2;const b=await encode(c,s.fmt,mid);
+      if(b.size<=lim){best={b,q:mid};lo=mid}else hi=mid;
+      if(lim-best.b.size<lim*0.005)break; // à moins de 0,5 % de la cible : suffisant
+    }
+    return finish(it,s,best.b,w,h,w0,h0,Math.round(best.q),sizeNote(best.b.size,lim,w,h,w0,h0,best.q,capped));
   }
-  if(blob.type!==s.fmt){it.fmtFallback=true}else it.fmtFallback=false;
-  let usedOrig=false;
-  if(s.keepOrig&&blob.size>=it.size&&scale===1&&it.file.type===s.fmt){blob=it.file;usedOrig=true}
-  return {blob,w,h,w0,h0,q,usedOrig,hitTarget,ext:EXT[blob.type]||EXT[s.fmt]};
+  const q=last.q;return finish(it,s,last.b,last.w,last.h,w0,h0,q,{t:`Impossible de descendre sous ${fmtSize(lim)}.`,warn:true});
+}
+function sizeNote(size,lim,w,h,w0,h0,q,capped){
+  const parts=[`Visé ${fmtSize(lim)} → ${fmtSize(size)} (${Math.round(size/lim*100)} %)`];
+  if(w!==w0)parts.push(capped?`dimensions limitées à ${w}×${h} par ce navigateur`:`dimensions réduites à ${w}×${h} pour tenir le poids`);
+  parts.push(`qualité ${Math.round(q)}`);
+  let t=parts.join(" · ");
+  const warn=q>=100&&size<lim*0.9;
+  if(warn)t+=`. C'est le maximum possible pour cette photo : au-delà, le fichier serait plus lourd sans aucun gain de qualité.`;
+  return {t,warn};
+}
+function finish(it,s,blob,w,h,w0,h0,q,note){
+  if(blob!==it.file&&blob.type!==s.fmt)note={t:"Ton navigateur ne sait pas créer ce format : bascule en JPG.",warn:true};
+  return {blob,w,h,w0,h0,q,note,usedOrig:blob===it.file,ext:EXT[blob.type]||EXT[s.fmt]};
 }
 
 let gen=0,timer=null;
@@ -304,23 +366,21 @@ function render(){
 }
 function renderItem(it){
   const li=$("it"+it.id);if(!li)return;
-  let sizes,gain="",bar=0,note="",cls="gain";
+  let sizes,gain="",bar=0,note="",noteCls="note",cls="gain";
   if(it.status==="done"){
     const o=it.out,pct=Math.round((1-o.blob.size/it.size)*100);
     sizes=`${fmtSize(it.size)} · ${o.w0}×${o.h0} → <b>${fmtSize(o.blob.size)}</b> · ${o.w}×${o.h}`;
     gain=(pct>0?"−":"+")+Math.abs(pct)+" %";bar=Math.max(0,pct);
     if(pct<=0)cls+=" warn";
-    if(o.usedOrig)note="Déjà optimisée : l'original est conservé.";
-    else if(!o.hitTarget)note="Poids cible impossible à cette taille : baisse le côté max.";
-    else if(state.target>0&&o.q!==state.q)note=`Qualité ajustée à ${o.q} pour tenir le poids cible.`;
-    if(it.fmtFallback)note="Ton navigateur ne sait pas créer ce format : bascule en JPG.";
+    if(o.note){note=o.note.t;if(o.note.warn)noteCls+=" warn"}
   }else if(it.status==="error"){
-    sizes=fmtSize(it.size);note=/\.(heic|heif)$/i.test(it.name)?"Format HEIC (iPhone) non lu par ce navigateur. Exporte-la en JPG d'abord, ou ouvre la page dans Safari.":"Image illisible.";cls+=" warn";gain="erreur";
+    sizes=fmtSize(it.size);note=/\.(heic|heif)$/i.test(it.name)?"Format HEIC (iPhone) non lu par ce navigateur. Exporte-la en JPG d'abord, ou ouvre la page dans Safari.":"Image illisible.";cls+=" warn";noteCls+=" warn";gain="erreur";
   }else sizes=`${fmtSize(it.size)} · ${it.status==="work"?"compression…":"en attente"}`;
   li.innerHTML=`<img alt="" src="${it.thumb}">
-    <div class="meta"><div class="name"></div><div class="sizes">${sizes}</div><div class="bar"><i style="width:${bar}%"></i></div>${note?`<div class="note">${note}</div>`:""}</div>
+    <div class="meta"><div class="name"></div><div class="sizes">${sizes}</div><div class="bar"><i style="width:${bar}%"></i></div>${note?`<div class="${noteCls}"></div>`:""}</div>
     <div class="side"><div class="${cls}">${gain}</div><div class="actions"><button class="btn small" data-dl="${it.id}" ${it.status!=="done"?"disabled":""}>Télécharger</button></div><button class="rm" data-rm="${it.id}">Retirer</button></div>`;
   const n=li.querySelector(".name");n.textContent=it.name;
+  const nt=li.querySelector(".note");if(nt)nt.textContent=note;
   if(it.sample){const t=document.createElement("span");t.className="tag";t.textContent="exemple";n.appendChild(t)}
 }
 function renderSummary(){
